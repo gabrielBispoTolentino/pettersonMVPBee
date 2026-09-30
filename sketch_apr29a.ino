@@ -12,7 +12,7 @@
 
 // ── Pinos ──────────────────────────────────────────────────────
 #define DHT_PIN        32
-#define DHT_TYPE       DHT11
+#define DHT_TYPE       DHT22
 
 // Pinos do módulo microSD (mesma fiação do ESP32-microSD-Card-Wiring-Diagram.png)
 #define SD_CS          5
@@ -30,12 +30,21 @@
 #define SENSOR_INTERVAL_MS      2000    // frequência de leitura do DHT
 #define WIFI_RETRY_INTERVAL_MS  30000   // intervalo entre tentativas de reconexão
 
+// HOTSPOT-FALLBACK: se a rede salva cair durante o uso, espera este tempo
+// antes de reabrir o hotspot (evita abrir por uma queda de poucos segundos).
+// No boot, se a rede salva não conectar, o hotspot abre imediatamente.
+#define AP_FALLBACK_DELAY_MS    60000
+
 // ── HiveMQ Cloud ───────────────────────────────────────────────
 const char* mqttHost = "2cd4e9f8396443f9bf9c16820fac480f.s1.eu.hivemq.cloud";
 const int   mqttPort = 8883;
 const char* mqttUser = "rustServer";
 const char* mqttPass = "Petterson67";
-const char* topic    = "sensors/leitura";
+
+// MULTI-DEVICE: o tópico e o ID agora são montados no setup() a partir do MAC.
+// Resultado: sensors/<deviceId>/leitura  (ex.: sensors/A4CF12345678/leitura)
+String deviceId;
+String topic;
 
 // ── Objetos ────────────────────────────────────────────────────
 DHT dht(DHT_PIN, DHT_TYPE);
@@ -49,9 +58,20 @@ Preferences prefs;
 bool sdReady = false;
 bool hasCredentials = false;  // true se já existe SSID salvo no NVS
 bool apMode = false;          // true enquanto o portal de configuração está ativo em paralelo
+bool routesReady = false;     // HOTSPOT-FALLBACK: rotas do WebServer só são registradas uma vez
 bool pendingSDData = false;   // true se existem leituras no SD ainda não enviadas ao servidor
 unsigned long lastWifiAttempt = 0;
 unsigned long lastSensorRead = 0;
+unsigned long wifiDownSince = 0; // HOTSPOT-FALLBACK: quando o WiFi caiu (0 = está conectado)
+
+// ─────────────────────────────────────────────────────────────
+//  ID do dispositivo (MAC sem ":")
+// ─────────────────────────────────────────────────────────────
+String getDeviceId() {
+  String id = WiFi.macAddress();
+  id.replace(":", "");
+  return id;
+}
 
 // ─────────────────────────────────────────────────────────────
 //  Páginas HTML do portal
@@ -90,11 +110,13 @@ const char SAVED_HTML[] PROGMEM = R"rawliteral(
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Salvo!</title>
   <style>body{font-family:sans-serif;text-align:center;margin-top:80px;}</style>
 </head>
 <body>
   <h2>Credenciais salvas!</h2>
+  <p>ID do dispositivo: <b>%DEVICE_ID%</b></p>
   <p>O ESP32 vai reiniciar e se conectar à rede.</p>
   <p>Você pode fechar esta página.</p>
 </body>
@@ -125,7 +147,11 @@ void setupRoutes() {
     prefs.putString("pass", newPass);
     prefs.end();
 
-    server.send_P(200, "text/html", SAVED_HTML);
+    // Monta a página de confirmação com o ID do dispositivo
+    String page = String(SAVED_HTML);
+    page.replace("%DEVICE_ID%", getDeviceId());
+    server.send(200, "text/html", page);
+
     Serial.println("[WiFi] Credenciais salvas. Reiniciando...");
     delay(1500);
     ESP.restart();
@@ -156,22 +182,71 @@ void setupRoutes() {
 //  Portal de configuração — roda em SEGUNDO PLANO (não bloqueia)
 //  para que a leitura do sensor e o log no SD continuem normalmente
 //  mesmo enquanto o WiFi ainda não foi configurado.
+//
+//  HOTSPOT-FALLBACK: também é usado quando já existem credenciais
+//  mas a rede salva está indisponível. Nesse caso o modo é AP+STA,
+//  para o ESP32 continuar tentando reconectar à rede salva enquanto
+//  o hotspot está aberto.
 // ─────────────────────────────────────────────────────────────
 void startConfigPortalBackground() {
-  Serial.println("[WiFi] Sem credenciais salvas — portal de configuração ativo em paralelo.");
+  if (apMode) return; // já está ativo
+
+  if (hasCredentials) {
+    Serial.println("[WiFi] Rede salva indisponível — reabrindo hotspot de configuração.");
+  } else {
+    Serial.println("[WiFi] Sem credenciais salvas — portal de configuração ativo em paralelo.");
+  }
   Serial.println("[WiFi] O sensor continua lendo e gravando no SD normalmente.");
 
-  WiFi.mode(WIFI_AP);
+  WiFi.mode(hasCredentials ? WIFI_AP_STA : WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
 
   IPAddress apIP = WiFi.softAPIP();
   Serial.printf("[WiFi] Hotspot: \"%s\"  IP: %s\n", AP_SSID, apIP.toString().c_str());
 
   dnsServer.start(53, "*", apIP);
-  setupRoutes();
+  if (!routesReady) {
+    setupRoutes();
+    routesReady = true;
+  }
   server.begin();
 
   apMode = true;
+}
+
+// HOTSPOT-FALLBACK: desliga o hotspot quando a rede salva voltou
+void stopConfigPortal() {
+  if (!apMode) return;
+
+  Serial.println("[WiFi] Rede salva reconectada — fechando hotspot de configuração.");
+  dnsServer.stop();
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  apMode = false;
+}
+
+// HOTSPOT-FALLBACK: chamado a cada volta do loop()
+//  - WiFi caiu por mais de AP_FALLBACK_DELAY_MS  -> reabre o hotspot
+//  - WiFi voltou e ninguém está conectado no hotspot -> fecha o hotspot
+void manageWifiFallback() {
+  if (!hasCredentials) return; // sem credenciais o portal fica aberto sempre
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiDownSince = 0;
+    if (apMode && WiFi.softAPgetStationNum() == 0) {
+      stopConfigPortal();
+    }
+    return;
+  }
+
+  if (wifiDownSince == 0) {
+    wifiDownSince = millis();
+  }
+
+  if (!apMode && millis() - wifiDownSince > AP_FALLBACK_DELAY_MS) {
+    startConfigPortalBackground();
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -179,8 +254,9 @@ void startConfigPortalBackground() {
 //
 //  Se não houver credenciais salvas, NÃO bloqueia: abre o portal em
 //  segundo plano e deixa o setup() seguir para a leitura/log no SD.
-//  Se houver credenciais mas a rede estiver fora do ar, também segue
-//  em frente offline — o loop() tenta reconectar periodicamente.
+//  Se houver credenciais mas a rede estiver fora do ar, abre o hotspot
+//  (HOTSPOT-FALLBACK) e segue offline — o loop() continua tentando
+//  reconectar periodicamente.
 // ─────────────────────────────────────────────────────────────
 void connectWiFi() {
   prefs.begin("wifi", true);
@@ -209,6 +285,7 @@ void connectWiFi() {
     Serial.println("\n[WiFi] Conectado: " + WiFi.localIP().toString());
   } else {
     Serial.println("\n[WiFi] Rede indisponível no momento — seguindo offline (log no SD).");
+    startConfigPortalBackground(); // HOTSPOT-FALLBACK: reabre o hotspot para reconfigurar
   }
 }
 
@@ -315,6 +392,7 @@ void flushSDLogs() {
     float logH = line.substring(c2 + 1).toFloat();
 
     JsonDocument payload;
+    payload["deviceId"] = deviceId;     // MULTI-DEVICE
     payload["tempDHT"]  = logT;
     payload["umidade"]  = logH;
     payload["offline"]  = true;
@@ -323,7 +401,7 @@ void flushSDLogs() {
     char buffer[250];
     serializeJson(payload, buffer, sizeof(buffer));
 
-    bool ok = client.publish(topic, buffer, false); // retain=false: são leituras históricas
+    bool ok = client.publish(topic.c_str(), buffer, false); // retain=false: são leituras históricas
     client.loop();
 
     if (ok) {
@@ -373,7 +451,9 @@ void flushSDLogs() {
 bool tryConnectMQTT() {
   if (client.connected()) return true;
 
-  String clientId = "ESP32-" + String(random(0xffff), HEX);
+  // MULTI-DEVICE: client ID único e estável por placa (antes era aleatório).
+  // Dois clientes com o mesmo ID se derrubam mutuamente no broker.
+  String clientId = "bee-" + deviceId;
   Serial.print("[MQTT] Conectando ao broker HiveMQ...");
 
   if (client.connect(clientId.c_str(), mqttUser, mqttPass)) {
@@ -394,7 +474,14 @@ void setup() {
   dht.begin();
   sdReady = setupSD();
 
-  connectWiFi(); // não bloqueia mais quando não há credenciais salvas
+  connectWiFi(); // não bloqueia: abre o hotspot se não houver rede utilizável
+
+  // MULTI-DEVICE: monta ID e tópico DEPOIS do connectWiFi(), porque o MAC
+  // só é lido corretamente depois que o WiFi foi inicializado.
+  deviceId = getDeviceId();
+  topic = "sensors/" + deviceId + "/leitura";
+  Serial.printf("[ID] Dispositivo: %s\n", deviceId.c_str());
+  Serial.printf("[ID] Tópico MQTT: %s\n", topic.c_str());
 
   espClient.setInsecure();
   client.setServer(mqttHost, mqttPort);
@@ -409,6 +496,9 @@ void loop() {
     dnsServer.processNextRequest();
     server.handleClient();
   }
+
+  // HOTSPOT-FALLBACK: abre/fecha o hotspot conforme o estado do WiFi salvo
+  manageWifiFallback();
 
   // Mantém a conexão MQTT viva quando já está conectado
   if (client.connected()) {
@@ -450,14 +540,15 @@ void loop() {
 
   if (online) {
     JsonDocument payload;
-    payload["tempDHT"] = t;
-    payload["umidade"] = h;
+    payload["deviceId"] = deviceId;     // MULTI-DEVICE
+    payload["tempDHT"]  = t;
+    payload["umidade"]  = h;
 
     char buffer[250];
     serializeJson(payload, buffer, sizeof(buffer));
 
-    bool ok = client.publish(topic, buffer, true);
-    Serial.printf("Publicado em '%s': %s [%s]\n\n", topic, buffer, ok ? "OK" : "FALHOU");
+    bool ok = client.publish(topic.c_str(), buffer, true);
+    Serial.printf("Publicado em '%s': %s [%s]\n\n", topic.c_str(), buffer, ok ? "OK" : "FALHOU");
 
     if (!ok) {
       logToSD(t, h); // publish falhou mesmo online -> guarda local também
