@@ -364,6 +364,7 @@ void flushSDLogs() {
   }
 
   String header = f.readStringUntil('\n');
+  header.trim(); // remove '\r' para não acumular quebras de linha a cada sincronização
 
   SD.remove(LOG_TMP_FILE);
   File tmp;
@@ -426,7 +427,9 @@ void flushSDLogs() {
       File rf = SD.open(LOG_TMP_FILE, FILE_READ);
       if (rf) {
         while (rf.available()) {
-          nf.println(rf.readStringUntil('\n'));
+          String l = rf.readStringUntil('\n');
+          l.trim();
+          if (l.length() > 0) nf.println(l);
         }
         rf.close();
       }
